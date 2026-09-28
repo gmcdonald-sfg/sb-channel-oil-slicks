@@ -1,0 +1,866 @@
+---
+title: "Oil slicks near the Santa Ynez Unit platforms before and after restart"
+subtitle: "A before/after/control/impact (BACI) look at SkyTruth Cerulean detections in the Santa Barbara Channel"
+date: today
+date-format: long
+format:
+  html:
+    embed-resources: true      # one self-contained .html file (figures included)
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    number-sections: true
+    theme: cosmo
+    code-fold: true            # analysis code is shown, collapsed, under each step
+    code-summary: "Show code"
+    code-tools: true           # "</> Code" menu: show/hide all code, view this file's source
+    fig-align: center
+    fig-dpi: 100               # x2 for high-resolution screens
+    tbl-cap-location: top
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+<!--
+==============================================================================
+ NOTES FOR PEOPLE EDITING THIS FILE
+==============================================================================
+ This one file is the whole project: it downloads the data, runs the analysis
+ and writes the report. Rendering it produces report.html.
+
+ * To change the study area, dates, restart dates, platforms or zone sizes,
+   edit the `settings` chunk directly below. Nothing else needs to change.
+ * To get the latest satellite data, set `refresh_data <- TRUE` in settings,
+   render once, then set it back to FALSE and commit the updated data/ folder.
+ * Render locally:   quarto render report.qmd      (takes ~2 minutes)
+   On GitHub, pushing a change to this file (or to data/) re-renders it and
+   republishes the website automatically (.github/workflows/render-report.yml).
+
+ How the chunks are organised
+ ----------------------------
+ There are two kinds of R chunk:
+
+ 1. ANALYSIS chunks, marked with `#| analysis: true`. These do the actual
+    work (download, build the grid, estimate effects). Their code is shown,
+    collapsed, in the section it belongs to, but they are all RUN at the
+    start of the document by the `run-analysis` chunk, in the order they
+    appear. That is what lets the "Bottom line" at the very top quote results.
+    Analysis chunks should only create objects; they print nothing.
+
+ 2. PRESENTATION chunks (everything else): figures, tables and inline
+    numbers. They run where they appear and only read objects created by
+    the analysis chunks. Their code is hidden in the report.
+
+ Working interactively in RStudio: run the `settings` and `setup` chunks,
+ then run the analysis chunks top to bottom ("Run All" works too). If a
+ render fails inside `run-analysis`, do this to find the chunk at fault.
+
+ The written interpretation (prose) was written for the data through
+ September 2026. Numbers in the text update automatically; the wording does
+ not, so reread it after big changes to the data or settings.
+==============================================================================
+-->
+
+```{r}
+#| label: settings
+#| include: false
+
+# ============================================================================
+# SETTINGS: everything you might want to change lives here.
+# ============================================================================
+
+# ---- Study area -------------------------------------------------------------
+# Bounding box in longitude/latitude (WGS84). Used both for the data download
+# and as the analysis area (the ocean inside this box).
+bbox <- c(xmin = -120.65, ymin = 33.85, xmax = -119.0, ymax = 34.50)
+
+# ---- Dates ------------------------------------------------------------------
+# Period of slicks and satellite scenes to use (inclusive, UTC). An end date in
+# the future is fine: you get everything available up to today.
+date_start <- "2023-01-01"
+date_end   <- "2026-12-31"
+
+# ---- Restart dates ----------------------------------------------------------
+# "Before" = everything before `restart`. "After" is split into two phases.
+restart  <- as.POSIXct("2025-05-01", tz = "UTC")  # Harmony test restart: start of "After"
+restart2 <- as.POSIXct("2026-03-14", tz = "UTC")  # shipping resumes; start of "After: phase 2"
+
+# ---- Platforms --------------------------------------------------------------
+# Locations from the BOEM Santa Ynez Unit Development and Production Plan.
+# infra_id = the platform's ID in Cerulean's infrastructure database, used to
+# count slicks Cerulean's model attributes to each platform.
+platforms_ll <- data.frame(
+  name     = c("Hondo",     "Harmony",   "Heritage"),
+  lon      = c(-120.1203,   -120.1675,   -120.2786),
+  lat      = c(34.3907,     34.3767,     34.3502),
+  infra_id = c("74569",     "117006",    "430365")
+)
+
+# ---- Zones ------------------------------------------------------------------
+R_imp        <- 5     # km. Impact zone = ocean within this distance of any platform
+R_excl       <- 10    # km. Control zone = ocean farther than this from every platform
+cell_m       <- 1000  # m. Size of the square grid cells the ocean is divided into
+min_imp_cov  <- 0.9   # a satellite pass is used only if it images at least this share of the impact zone
+nearshore_km <- 12    # km. "Nearshore" control areas = within this distance of the mainland coast
+
+# ---- Statistics -------------------------------------------------------------
+n_boot <- 2000        # bootstrap draws for 95% intervals (more = slower but more stable)
+
+# ---- Data -------------------------------------------------------------------
+# FALSE: use the snapshot saved in data/ (fast, reproducible).
+# TRUE:  re-download everything from the Cerulean API (a few minutes; no key needed).
+refresh_data <- FALSE
+cerulean_api <- "https://api.cerulean.skytruth.org/collections"
+```
+
+```{r}
+#| label: setup
+#| include: false
+
+suppressPackageStartupMessages({
+  library(tidyverse)   # data wrangling (dplyr, readr, purrr, ...) and plotting (ggplot2)
+  library(data.table)  # fast tables for the large cell-by-pass panel (loaded after tidyverse on purpose)
+  library(sf)          # spatial data: grid cells, slick polygons, satellite footprints
+  library(jsonlite)    # reading the satellite scene list
+  library(patchwork)   # combining plots
+  library(knitr)
+  library(kableExtra)  # table styling
+})
+sf_use_s2(FALSE)       # planar geometry; everything is projected to metres below
+
+# Chunks marked `analysis: true` are shown where they sit, but run by `run-analysis`
+# at the top (see the notes at the top of this file).
+knitr::opts_hooks$set(analysis = function(options) {
+  if (isTRUE(options$analysis)) { options$eval <- FALSE; options$echo <- TRUE }
+  options
+})
+
+# ---- Formatting helpers for text and tables ---------------------------------
+pct <- function(x, d = 2) sprintf("%.*f%%", d, 100 * x)            # 0.0123 -> "1.23%"
+pts <- function(x, d = 2) sprintf("%+.*f", d, 100 * x)             # 0.0056 -> "+0.56" (percentage points)
+ci  <- function(lo, hi, d = 2) sprintf("%.*f to %.*f", d, 100 * lo, d, 100 * hi)
+day_fmt <- function(x, m = "%B") { x <- as.Date(x); paste0(format(x, m), " ", as.integer(format(x, "%d")), ", ", format(x, "%Y")) }
+mon_fmt <- function(x) format(as.Date(x), "%b %Y")
+styl <- function(k) kable_styling(k, bootstrap_options = c("striped", "condensed", "hover"), full_width = FALSE)
+period_levels <- c("Before", "After: phase 1", "After: phase 2")
+metric_name <- c(occ = "Occurrence", oil_frac = "Oiled fraction")
+
+# ---- Plot style -------------------------------------------------------------
+ink <- "#0b0b0b"; ink2 <- "#52514e"; muted <- "#898781"; gridc <- "#e1e0d9"; surf <- "#fcfcfb"
+col_imp <- "#eb6834"; col_ctl <- "#2a78d6"
+theme_set(theme_minimal(base_size = 11) +
+  theme(plot.background = element_rect(fill = surf, colour = NA), panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(colour = gridc, linewidth = .3), axis.text = element_text(colour = muted),
+        axis.title = element_text(colour = ink2), plot.title = element_text(colour = ink, face = "bold"),
+        plot.subtitle = element_text(colour = ink2), plot.caption = element_text(colour = muted, hjust = 0),
+        legend.text = element_text(colour = ink2), legend.title = element_text(colour = ink2),
+        strip.text = element_text(colour = ink, face = "bold")))
+knitr::opts_chunk$set(dev.args = list(bg = surf))
+restart_lines <- list(geom_vline(xintercept = restart,  colour = ink2,  linewidth = .4, linetype = "22"),
+                      geom_vline(xintercept = restart2, colour = muted, linewidth = .4, linetype = "22"))
+```
+
+```{r}
+#| label: run-analysis
+#| include: false
+#| ref.label: !expr knitr::all_labels(isTRUE(analysis))
+# Runs every chunk marked `analysis: true`, in document order. Intentionally empty.
+```
+
+::: {.callout-note appearance="simple"}
+## Bottom line
+
+After Harmony's test restart (`r day_fmt(restart)`), the share of sea surface with a detected slick within `r R_imp` km of the three platforms rose from **`r pct(occ$I_before)` to `r pct(occ$I_after)`** of imaged area per satellite pass. Over the rest of the Channel it rose from `r pct(occ$C_before)` to `r pct(occ$C_after)`. The increase is concentrated at **Harmony and Hondo**; Heritage shows no change.
+
+The signal is **suggestive but not conclusive**. After adjusting for season, the effect is `r pts(occ$adj_DiD)` percentage points (95% CI `r ci(occ$adj_lo, occ$adj_hi)`). About `r round(100 * occ$placebo_p)`% of randomly placed "placebo" platform zones in the Channel show a change at least as large. The result also depends on the comparison area: against the nearby Coal Oil Point seep band, which also got oilier, the effect is close to zero.
+:::
+
+# Question and background
+
+Did the restart of oil production at platforms **Harmony, Heritage and Hondo** (Santa Ynez Unit, operated by Sable Offshore) change the number or area of oil slicks detected in the Santa Barbara Channel?
+
+The platforms were shut in after the 2015 Refugio pipeline spill. The restart was staggered:
+
+| Date | Event |
+|---|---|
+| May 2025 | Sable restarts six wells on **Harmony** as a test. This analysis uses `r as.Date(restart)` as the start of the "After" period. |
+| `r as.Date(restart2)` | Shipping from Las Flores Canyon resumes under a Department of Energy order. Harmony produces about 22,000 b/d. This starts **phase 2** here. |
+| ~April 2026 | **Heritage** cleared by BSEE to resume operations. |
+| Q3 2026 (expected) | **Hondo** expected to come online. |
+
+: Restart timeline (see [Sources](#sources)) {.striped}
+
+Because of the staggered timeline, results are shown for the whole After period and for two phases: **phase 1** (Harmony test only) and **phase 2** (full restart).
+
+# Data
+
+**Slicks.** All slick polygons from SkyTruth Cerulean's public API (`public.slick_plus`) for the study area and dates in the [settings](#settings):
+
+```{r}
+#| results: asis
+cat(sprintf("<pre style='white-space:pre-wrap;font-size:0.8em'>%s</pre>\n",
+            api_url("public.slick_plus", "csv", 10000, 0)))
+```
+
+That returned **`r format(n_slicks_downloaded, big.mark = ",")` slicks** from `r mon_fmt(min(slick_dt$t))` to `r mon_fmt(max(slick_dt$t))`.`r if (nrow(slick_dt) < n_slicks_downloaded) sprintf(" Of these, %s come from a satellite scene that images the study area and are used here.", format(nrow(slick_dt), big.mark = ","))`
+
+**Imaging effort.** Cerulean only reports scenes where it found a slick, but a slick can only be seen when a Sentinel-1 radar satellite passes overhead. I therefore also downloaded every Sentinel-1 scene Cerulean ingested over the same box (`public.sentinel1_grd`), including scenes with no detections. Adjacent frames from one orbit were merged into a single **pass**. That gives `r nrow(passes)` passes, `r nrow(per_pass)` of which image at least `r round(100 * min_imp_cov)`% of the platform zone and are used in the BACI comparisons.
+
+```{r}
+#| label: get-data
+#| analysis: true
+
+# Download slicks and satellite scenes from the Cerulean API, unless we already
+# have a saved copy in data/ and `refresh_data` is FALSE.
+bbox_str  <- paste(bbox[c("xmin", "ymin", "xmax", "ymax")], collapse = ",")
+dates_str <- sprintf("%sT00:00:00Z/%sT23:59:59Z", date_start, date_end)
+api_url <- function(collection, format, limit, offset)
+  sprintf("%s/%s/items?f=%s&limit=%d&offset=%d&datetime=%s&bbox=%s",
+          cerulean_api, collection, format, limit, offset, dates_str, bbox_str)
+
+if (refresh_data || !file.exists("data/slicks.csv") || !file.exists("data/s1_scenes.json")) {
+  dir.create("data", showWarnings = FALSE)
+
+  # Slicks (public.slick_plus): CSV, fetched 10,000 rows at a time
+  pages <- list(); offset <- 0
+  repeat {
+    tmp <- tempfile(fileext = ".csv")
+    download.file(api_url("public.slick_plus", "csv", 10000, offset), tmp, quiet = TRUE)
+    page <- read_csv(tmp, col_types = cols(.default = "c"))
+    pages[[length(pages) + 1]] <- page
+    if (nrow(page) < 10000) break
+    offset <- offset + 10000
+  }
+  bind_rows(pages) %>% distinct(id, .keep_all = TRUE) %>% write_csv("data/slicks.csv", na = "")
+
+  # Every Sentinel-1 scene Cerulean processed over the box (public.sentinel1_grd),
+  # including scenes with no slicks: this is our measure of imaging effort.
+  pages <- list(); offset <- 0
+  repeat {
+    page <- fromJSON(api_url("public.sentinel1_grd", "json", 500, offset))
+    pages[[length(pages) + 1]] <- page
+    if (NROW(page) < 500) break
+    offset <- offset + 500
+  }
+  write_json(bind_rows(pages), "data/s1_scenes.json")
+}
+```
+
+```{r}
+#| label: build-grid
+#| analysis: true
+
+# Divide the ocean in the study area into square cells (default 1 km).
+crs_m <- 3310  # California Albers, in metres
+
+platforms <- platforms_ll %>% st_as_sf(coords = c("lon", "lat"), crs = 4326) %>% st_transform(crs_m)
+
+# Land (Natural Earth 1:50m); ocean = study box minus land
+land <- rnaturalearth::ne_countries(scale = 50, returnclass = "sf") %>% st_make_valid() %>%
+  st_crop(st_bbox(bbox + c(-1, -1, 1, 1), crs = 4326)) %>% st_union() %>% st_transform(crs_m)
+domain <- st_as_sfc(st_bbox(bbox, crs = 4326)) %>% st_transform(crs_m)
+ocean  <- st_difference(domain, land)
+
+# Keep cells whose centre is in the ocean
+grid <- st_make_grid(domain, cellsize = cell_m) %>% st_sf(geometry = .)
+grid <- grid[lengths(st_intersects(st_centroid(grid), ocean)) > 0, ]
+grid$cell    <- seq_len(nrow(grid))
+grid$cell_m2 <- as.numeric(st_area(grid))
+centres <- st_centroid(grid)
+
+# Distance to the nearest platform, and which platform that is
+dist_to_platforms <- st_distance(centres, platforms)
+grid$dist_km <- as.numeric(apply(dist_to_platforms, 1, min)) / 1000
+grid$nearest <- platforms$name[apply(dist_to_platforms, 1, which.min)]
+
+# Cell coordinates (metres and longitude) and distance to the mainland coast
+xy <- st_coordinates(centres); grid$x <- xy[, 1]; grid$y <- xy[, 2]
+grid$lon <- st_coordinates(st_transform(centres, 4326))[, 1]
+land_parts <- st_cast(land, "POLYGON")
+mainland   <- land_parts[which.max(st_area(land_parts))]
+grid$coast_km <- as.numeric(st_distance(centres, mainland)) / 1000
+```
+
+```{r}
+#| label: build-panel
+#| analysis: true
+
+# Build the core dataset: for every satellite pass, which cells it imaged and how
+# much of each cell was oiled. Cells that were imaged but had no slick get oil = 0,
+# which is what lets us compare rates rather than raw counts.
+
+# ---- Satellite scenes and their footprints
+scenes <- fromJSON("data/s1_scenes.json") %>% as_tibble() %>%
+  distinct(scene_id, .keep_all = TRUE) %>%
+  mutate(t = ymd_hms(start_time), sat = substr(scene_id, 1, 3)) %>%   # sat = S1A, S1C, S1D
+  filter(t >= as.POSIXct(date_start, tz = "UTC"), t < as.POSIXct(date_end, tz = "UTC") + 86400)
+scene_geom <- st_as_sfc(sub("^SRID=4326;", "", scenes$geometry), crs = 4326) %>% st_transform(crs_m)
+scenes <- st_sf(scenes %>% select(-geometry, -url), geometry = scene_geom)
+scenes$scene <- seq_len(nrow(scenes))
+
+# A cell counts as imaged by a scene when the cell's centre is inside the scene footprint
+covered  <- st_intersects(scenes, centres)
+scenes   <- scenes[lengths(covered) > 0, ]
+covered  <- covered[lengths(covered) > 0]
+coverage <- data.table(scene = rep(scenes$scene, lengths(covered)), cell = unlist(covered))
+
+# ---- Slicks, matched to the scene they were detected in
+slicks <- read_csv("data/slicks.csv", show_col_types = FALSE)
+n_slicks_downloaded <- nrow(slicks)
+slick_geom <- st_as_sfc(sub("^SRID=4326;", "", slicks$geometry), crs = 4326) %>% st_make_valid() %>% st_transform(crs_m)
+slicks <- st_sf(slicks %>% select(id, slick_timestamp, machine_confidence, cls, hitl_cls, area, length,
+                                  s1_scene_id, source_type_2_ids),
+                geometry = slick_geom) %>%
+  mutate(t = ymd_hms(slick_timestamp))
+slicks$scene <- scenes$scene[match(slicks$s1_scene_id, scenes$scene_id)]
+slicks <- slicks[!is.na(slicks$scene), ]
+
+# Oiled area of each slick inside each grid cell
+pieces <- st_intersection(slicks %>% select(id, scene), grid %>% select(cell))
+slick_cells <- data.table(id = pieces$id, scene = pieces$scene, cell = pieces$cell,
+                          oil_m2 = as.numeric(st_area(pieces)))
+oil <- slick_cells[, .(oil_m2 = sum(oil_m2)), by = .(scene, cell)]
+
+# Scene x cell panel: every imaged cell, plus oil in cells whose centre falls just
+# outside the footprint edge (the slick proves the cell was seen)
+scene_cells <- merge(coverage, oil, by = c("scene", "cell"), all.x = TRUE)
+scene_cells[is.na(oil_m2), oil_m2 := 0]
+scene_cells <- rbind(scene_cells, oil[!coverage, on = .(scene, cell)])
+
+# ---- Merge adjacent frames of one orbit into a single satellite "pass"
+scene_dt <- as.data.table(st_drop_geometry(scenes))
+scene_dt[, pass := paste(sat, absolute_orbit_number)]
+scene_dt[, t_pass := min(t), by = pass]
+passes <- unique(scene_dt[, .(pass, t = t_pass, sat)])
+passes[, period := fcase(t < restart, "Before", t < restart2, "After: phase 1", default = "After: phase 2")]
+passes[, month := floor_date(t, "month")]
+
+# cell_obs: one row per pass x imaged cell. Frames overlap slightly, so take the max.
+cell_obs <- merge(scene_cells, scene_dt[, .(scene, pass)], by = "scene")[
+  , .(oil_m2 = max(oil_m2)), by = .(pass, cell)]
+cell_obs[, cell_m2 := grid$cell_m2[cell]]
+
+# Slick attributes plus the pass and period each slick belongs to
+slick_dt <- as.data.table(st_drop_geometry(slicks)) %>%
+  merge(scene_dt[, .(scene, pass)], by = "scene") %>%
+  merge(passes[, .(pass, period)], by = "pass")
+```
+
+```{r}
+#| label: tbl-passes
+#| tbl-cap: "Sentinel-1 passes over the study area by year and satellite. Sentinel-1B failed in Dec 2021; Sentinel-1C entered service in spring 2025 and Sentinel-1D in early 2026."
+passes %>% as_tibble() %>% count(Year = year(t), sat) %>%
+  pivot_wider(names_from = sat, values_from = n, values_fill = 0) %>%
+  mutate(Total = rowSums(across(-Year))) %>% kable() %>% styl()
+```
+
+::: {.callout-warning appearance="simple"}
+## The main confounder: satellite coverage doubled at the same time as the restart
+
+Sentinel-1C came online within weeks of the Harmony restart. Raw slick counts therefore roughly double everywhere in the Channel, whatever the platforms did (@fig-effort). Every comparison below is per satellite pass, and compares the platform zone against a control area imaged on the same passes.
+:::
+
+```{r}
+#| label: fig-effort
+#| fig-cap: "Top: satellite passes per quarter. Bottom: raw slick detections per quarter. Dashed lines mark the Harmony test restart and the full restart."
+#| fig-width: 9
+#| fig-height: 6.5
+eff <- passes[, .N, by = .(q = floor_date(t, "quarter"), sat)]
+raw <- slick_dt[, .N, by = .(q = floor_date(t, "quarter"))]
+first_sat <- passes[, .(first = min(t)), by = sat][sat != "S1A"][order(first)]
+eff_ratio <- passes[t >= restart, .N / as.numeric(difftime(max(t), restart, units = "days"))] /
+             passes[t <  restart, .N / as.numeric(difftime(restart, min(t), units = "days"))]
+f1a <- ggplot(eff, aes(as.POSIXct(q), N, fill = sat)) + geom_col(width = 60*60*24*80, colour = surf, linewidth = .5) +
+  scale_fill_manual(values = c(S1A = "#2a78d6", S1C = "#eb6834", S1D = "#1baf7a"), name = NULL) + restart_lines +
+  labs(x = NULL, y = "Satellite passes", title = sprintf("Passes per day were %.1f× higher after the restart than before", eff_ratio),
+       caption = paste0("First passes: ", paste(first_sat$sat, day_fmt(first_sat$first, "%b"), collapse = "; "), "."),
+       subtitle = "Sentinel-1 passes over the Santa Barbara Channel per quarter") +
+  theme(legend.position = "top", legend.justification = "left")
+f1b <- ggplot(raw, aes(as.POSIXct(q), N)) + geom_col(width = 60*60*24*80, fill = muted) + restart_lines +
+  labs(x = NULL, y = "Slicks detected", subtitle = "Raw slick detections per quarter (all Cerulean slicks) - tracks effort",
+       caption = paste0("Dashed lines: ", day_fmt(restart, "%b"), " (start of After) and ", day_fmt(restart2, "%b"), " (start of phase 2)."))
+f1a / f1b
+```
+
+# Methods
+
+1. **Grid.** The ocean part of the study area is divided into `r cell_m / 1000` km cells (California Albers projection; land from Natural Earth 1:50m).
+2. **Panel.** For every pass, I record which cells it imaged (cell centre inside the scene footprint) and the oiled area of every slick in each cell. A cell counts as imaged on a pass even when no slick was found, which puts the zeros back into the data.
+3. **Zones.** *Impact* = cells within `r R_imp` km of any of the three platforms. *Control* = cells more than `r R_excl` km from every platform. Cells in between are dropped to reduce spillover.
+4. **Outcomes per pass and zone.**
+    - *Occurrence*: share of imaged cells touched by at least one slick.
+    - *Oiled fraction*: oiled area ÷ imaged area.
+
+   Both are rates per pass, so they don't depend on how often the Channel is imaged.
+5. **BACI estimate.** Difference-in-differences: (impact After − impact Before) − (control After − control Before). A ratio-of-ratios version is also shown.
+6. **Uncertainty and robustness.**
+    - **Seasonal adjustment.** The After period over-represents May–September, so pass-level (impact − control) differences are regressed on a post indicator plus month-of-year fixed effects.
+    - **Block bootstrap.** 95% intervals come from resampling calendar months within each period, which keeps weather-correlated passes together.
+    - **Placebo zones.** The three-platform layout is shifted across the Channel, and the effect is recomputed at every offset that stays over water and doesn't overlap the real platforms. This shows how unusual the real change is.
+    - **Placebo restart date.** A fake restart one year earlier, using only pre-restart data.
+    - **Sensitivity checks:** zone radius, choice of control area, and excluding slicks Cerulean classifies as natural seeps.
+
+```{r}
+#| label: methods-functions
+#| analysis: true
+
+# The building blocks every estimate below uses.
+
+# Label cells as "Impact", "Control" or NA (dropped) by distance to the nearest platform
+zone_of <- function(dist_km, r_imp = R_imp, r_excl = R_excl)
+  fifelse(dist_km <= r_imp, "Impact", fifelse(dist_km > r_excl, "Control", NA_character_))
+zone_map <- function(zone) data.table(cell = grid$cell, zone = zone)[!is.na(zone)]
+
+# For each pass: occurrence and oiled fraction in the impact and control zones.
+# Returns one row per usable pass (impact zone >= min_imp_cov imaged, control seen).
+pass_metrics <- function(zones, obs = cell_obs, min_ctl_cov = 0) {
+  z <- merge(obs, zones, by = "cell")
+  m <- z[, .(n_obs = .N, occ = mean(oil_m2 > 0), oil_frac = sum(oil_m2) / sum(cell_m2)), by = .(pass, zone)]
+  m <- merge(m, zones[, .(n_zone = .N), by = zone], by = "zone")[, cov := n_obs / n_zone]
+  w <- dcast(m, pass ~ zone, value.var = c("occ", "oil_frac", "cov"))
+  w <- w[cov_Impact >= min_imp_cov & !is.na(cov_Control) & cov_Control >= min_ctl_cov]
+  merge(w, passes, by = "pass")
+}
+
+# Plain BACI: before/after means in each zone, difference-in-differences, ratio of ratios.
+# y is "occ" or "oil_frac".
+did <- function(w, y) {
+  I <- w[[paste0(y, "_Impact")]]; C <- w[[paste0(y, "_Control")]]; before <- w$t < restart
+  I_b <- mean(I[before]); I_a <- mean(I[!before]); C_b <- mean(C[before]); C_a <- mean(C[!before])
+  c(I_before = I_b, I_after = I_a, C_before = C_b, C_after = C_a,
+    DiD = (I_a - I_b) - (C_a - C_b), ratio_of_ratios = (I_a / I_b) / (C_a / C_b))
+}
+
+# Season-adjusted BACI: regress (impact - control) per pass on an After indicator
+# plus calendar-month dummies. Returns the After coefficient.
+adj_did <- function(w, y, post_date = restart) {
+  gap  <- w[[paste0(y, "_Impact")]] - w[[paste0(y, "_Control")]]
+  post <- as.numeric(w$t >= post_date)
+  moy  <- factor(month(w$t))
+  if (length(unique(post)) < 2) return(NA_real_)
+  unname(coef(lm(gap ~ post + moy))["post"])
+}
+
+# Block bootstrap: resample whole calendar months (separately for Before and After)
+# and recompute `statistic`. Passes in the same month share weather, so they move together.
+block_bootstrap <- function(w, statistic, B = n_boot, seed = 1) {
+  set.seed(seed)
+  months <- split(w, w$month)
+  before <- sapply(months, function(m) m$t[1] < restart)
+  replicate(B, statistic(rbindlist(months[c(sample(which(before), replace = TRUE),
+                                            sample(which(!before), replace = TRUE))])))
+}
+q_lo <- function(x) unname(quantile(x, .025, na.rm = TRUE))
+q_hi <- function(x) unname(quantile(x, .975, na.rm = TRUE))
+```
+
+# Results
+
+## Where slicks occur
+
+```{r}
+#| label: fig-maps
+#| fig-cap: "Share of passes with oil in each 1 km cell, before vs after, and the change. The dashed ring is the impact zone around Heritage, Harmony and Hondo (west to east)."
+#| fig-width: 9
+#| fig-height: 10
+cm <- merge(cell_obs, passes[, .(pass, per = fifelse(t < restart, "Before", "After"))], by = "pass")[
+  , .(occ = mean(oil_m2 > 0)), by = .(cell, per)] %>% dcast(cell ~ per, value.var = "occ")
+g <- grid %>% left_join(as_tibble(cm), by = "cell") %>% mutate(change = (After - Before) * 100) %>% st_transform(4326)
+pl <- st_transform(platforms, 4326); land_ll <- st_transform(land, 4326)
+ring <- st_transform(st_union(st_buffer(platforms, R_imp * 1000)), 4326)
+bb <- st_bbox(g); rng <- range(passes$t)
+base_map <- list(
+  geom_sf(data = land_ll, fill = "#e9e8e3", colour = NA),
+  geom_sf(data = ring, fill = NA, colour = ink, linewidth = .35, linetype = "22"),
+  geom_sf(data = pl, shape = 21, fill = surf, colour = ink, size = 1.8, stroke = .7),
+  coord_sf(xlim = c(bb$xmin, bb$xmax), ylim = c(bb$ymin, bb$ymax), expand = FALSE),
+  theme(axis.text = element_text(size = 7), panel.grid.major = element_line(colour = "transparent")), labs(x = NULL, y = NULL))
+seq_cols <- c("#fcfcfb", "#cde2fb", "#86b6ef", "#3987e5", "#1c5cab", "#0d366b")
+lim <- quantile(c(g$Before, g$After) * 100, .995, na.rm = TRUE)
+occ_map <- function(v, sub) ggplot(g) + geom_sf(aes(fill = pmin({{ v }} * 100, lim)), colour = NA) + base_map +
+  scale_fill_gradientn(colours = seq_cols, limits = c(0, lim), name = "% of passes\nwith oil") + labs(subtitle = sub)
+mB <- occ_map(Before, paste0("Before (", mon_fmt(rng[1]), " - ", mon_fmt(restart - 86400), ")"))
+mA <- occ_map(After,  paste0("After (", mon_fmt(restart), " - ", mon_fmt(rng[2]), ")"))
+cl <- quantile(abs(g$change), .99, na.rm = TRUE)
+lab_pl <- cbind(st_drop_geometry(pl), st_coordinates(pl))
+mD <- ggplot(g) + geom_sf(aes(fill = pmax(pmin(change, cl), -cl)), colour = NA) + base_map +
+  scale_fill_gradientn(colours = c("#104281", "#5598e7", "#f0efec", "#e66767", "#a32323"), limits = c(-cl, cl), name = "Change\n(pct pts)") +
+  geom_text(data = lab_pl, aes(X, Y, label = name), nudge_y = .045, size = 2.8, colour = ink) +
+  labs(subtitle = "Change (after - before)")
+(mB / mA / mD) + plot_annotation(title = paste0("Where slicks occur: share of Sentinel-1 passes with oil in each ", cell_m / 1000, " km cell"),
+  caption = paste0("Dashed ring = ", R_imp, " km impact zone around the platforms. Colour capped at 99.5th percentile."))
+```
+
+The map shows the Channel's known natural-seep hotspots, Coal Oil Point (~119.9°W) and the Summerland/Carpinteria area (~119.6°W), plus a hotspot near Anacapa and Oxnard in the southeast. In the After period, oil increases along the **entire mainland nearshore band**, from Hondo east to Carpinteria, not only around the platforms. Surface currents along the mainland coast usually run westward, so seep slicks from Coal Oil Point can drift into the Hondo/Harmony zone.
+
+## Time series
+
+```{r}
+#| label: main-estimates
+#| analysis: true
+
+# Main BACI comparison: platform zone (<= R_imp km) vs rest of Channel (> R_excl km)
+zones_main <- zone_map(zone_of(grid$dist_km))
+per_pass   <- pass_metrics(zones_main)
+
+main <- map_dfr(c("occ", "oil_frac"), function(y) {
+  est  <- did(per_pass, y)
+  boot <- block_bootstrap(per_pass, function(x) did(x, y)[c("DiD", "ratio_of_ratios")], seed = 1)
+  adj  <- adj_did(per_pass, y)
+  boot_adj <- block_bootstrap(per_pass, function(x) adj_did(x, y), seed = 2)
+  tibble(metric = y, n_passes = nrow(per_pass),
+         I_before = est[["I_before"]], I_after = est[["I_after"]], C_before = est[["C_before"]], C_after = est[["C_after"]],
+         DiD = est[["DiD"]], DiD_lo = q_lo(boot[1, ]), DiD_hi = q_hi(boot[1, ]),
+         rr = est[["ratio_of_ratios"]], rr_lo = q_lo(boot[2, ]), rr_hi = q_hi(boot[2, ]),
+         adj_DiD = adj, adj_lo = q_lo(boot_adj), adj_hi = q_hi(boot_adj),
+         adj_pct_of_baseline = 100 * adj / est[["I_before"]])
+})
+
+# Quarterly means, for the time-series figure
+quarterly <- per_pass[, .(n = .N, I = mean(occ_Impact), C = mean(occ_Control)), by = .(q = floor_date(t, "quarter"))][order(q)]
+```
+
+```{r}
+#| label: fig-ts
+#| fig-cap: "Quarterly slick occurrence in the platform zone vs the rest of the Channel (top), and their difference (bottom)."
+#| fig-width: 9
+#| fig-height: 7
+ql <- melt(quarterly[, .(q, Impact = I * 100, Control = C * 100)], id.vars = "q", variable.name = "zone", value.name = "pct")
+ql[, zone := factor(zone, c("Impact", "Control"), c(paste0("Within ", R_imp, " km of platforms"), paste0("Rest of Channel (>", R_excl, " km)")))]
+f2a <- ggplot(ql, aes(as.POSIXct(q), pct, colour = zone)) + restart_lines +
+  geom_line(linewidth = .7) + geom_point(size = 2.2, stroke = .8, fill = surf, shape = 21) +
+  geom_text(data = ql[q == max(q)], aes(label = zone), hjust = 0, nudge_x = 60*60*24*25, size = 3.3, colour = ink2) +
+  scale_colour_manual(values = c(col_imp, col_ctl), name = NULL) +
+  scale_x_datetime(expand = expansion(mult = c(.02, .28))) +
+  labs(x = NULL, y = "% of observed area with a slick", title = "Slick occurrence near Harmony / Heritage / Hondo vs rest of Channel",
+       subtitle = "Mean per satellite pass, by quarter (passes that fully image the platform zone)") +
+  theme(legend.position = "top", legend.justification = "left")
+qd <- copy(quarterly)[, gap := (I - C) * 100]
+f2b <- ggplot(qd, aes(as.POSIXct(q), gap)) + geom_hline(yintercept = 0, colour = "#c3c2b7") +
+  geom_hline(yintercept = mean(qd[q < restart, gap]), colour = muted, linetype = "dotted") + restart_lines +
+  geom_col(width = 60*60*24*70, fill = ifelse(qd$q < restart, muted, col_imp)) +
+  scale_x_datetime(expand = expansion(mult = c(.02, .28))) +
+  labs(x = NULL, y = "Impact - control (pct pts)", subtitle = "Difference (dotted = pre-restart mean)",
+       caption = paste0("Occurrence = share of observed ", cell_m / 1000, " km cells intersected by a slick."))
+f2a / f2b + plot_layout(heights = c(3, 2))
+```
+
+Before the restart, the platform zone tracked the rest of the Channel, with no trend in the difference. After the restart, it was well above the Channel in Q3–Q4 2025 and again in Q3 2026. In between, in the first half of 2026, it dropped back to baseline, which includes the months right after the full restart. That dip doesn't fit a simple "more production → more slicks" story. Summer and fall peaks also appear in the pre-period (2023), which is why the seasonal adjustment matters.
+
+## Main BACI estimates
+
+```{r}
+#| label: tbl-main
+#| tbl-cap: "Mean per-pass rates (% of imaged area). DiD in percentage points; bootstrap 95% CI in brackets."
+main %>% transmute(
+  Outcome = metric_name[metric],
+  `Impact, before` = pct(I_before, 3), `Impact, after` = pct(I_after, 3),
+  `Control, before` = pct(C_before, 3), `Control, after` = pct(C_after, 3),
+  DiD = sprintf("%s [%s]", pts(DiD, 3), ci(DiD_lo, DiD_hi, 3)),
+  `Ratio of ratios` = sprintf("%.2f [%.2f–%.2f]", rr, rr_lo, rr_hi),
+  `Season-adjusted DiD` = sprintf("%s [%s]", pts(adj_DiD, 3), ci(adj_lo, adj_hi, 3)),
+  `Placebo p` = sprintf("%.2f", placebo_p)) %>%
+  kable(align = "lrrrrrrrr") %>% styl()
+```
+
+The platform zone went up by a factor of `r sprintf("%.1f", occ$I_after / occ$I_before)` and the control by `r sprintf("%.1f", occ$C_after / occ$C_before)`. That gives a ratio of ratios of `r sprintf("%.2f", occ$rr)` for occurrence. The oiled-fraction measure shows a larger relative change, because slicks touching the zone after the restart were also bigger (see [Slick-level checks](#slick-level-checks)). Once the seasonal mismatch is removed, both DiD intervals include zero.
+
+## How unusual is the change?
+
+```{r}
+#| label: placebo
+#| analysis: true
+
+# Placebo zones: shift the whole platform layout around the Channel on a 4 km lattice
+# and re-estimate the season-adjusted effect at each position. If many placebo
+# positions show an effect as big as the real one, the real one isn't unusual.
+pl_xy   <- st_coordinates(platforms)
+cell_xy <- cbind(grid$x, grid$y)
+n_imp_real <- zones_main[zone == "Impact", .N]
+gb <- st_bbox(grid); lattice <- function(a, b) seq(ceiling(a / 4e3) * 4e3, b, 4e3)
+offsets <- expand.grid(dx = lattice(gb[["xmin"]] - min(pl_xy[, 1]), gb[["xmax"]] - max(pl_xy[, 1])),
+                       dy = lattice(gb[["ymin"]] - min(pl_xy[, 2]), gb[["ymax"]] - max(pl_xy[, 2])))
+
+placebo <- map_dfr(seq_len(nrow(offsets)), function(i) {
+  shifted <- sweep(pl_xy, 2, c(offsets$dx[i], offsets$dy[i]), "+")
+  dmin <- apply(sapply(seq_len(nrow(shifted)), function(k)
+            sqrt((cell_xy[, 1] - shifted[k, 1])^2 + (cell_xy[, 2] - shifted[k, 2])^2)), 1, min) / 1000
+  imp <- dmin <= R_imp
+  if (sum(imp) < 0.9 * n_imp_real) return(NULL)       # mostly over land or outside the box
+  if (any(grid$dist_km[imp] <= R_excl)) return(NULL)  # overlaps the real platforms
+  zones <- zone_map(fifelse(imp, "Impact", fifelse(dmin > R_excl & grid$dist_km > R_excl, "Control", NA_character_)))
+  w <- pass_metrics(zones)
+  if (nrow(w) < 100) return(NULL)
+  tibble(dx = offsets$dx[i], dy = offsets$dy[i], n_passes = nrow(w),
+         occ = adj_did(w, "occ"), oil_frac = adj_did(w, "oil_frac"))
+})
+# Placebo p-value: share of placebo zones with an effect at least as large as the real one
+main$placebo_p <- c(mean(placebo$occ >= main$adj_DiD[1]), mean(placebo$oil_frac >= main$adj_DiD[2]))
+
+# Placebo restart date: pretend the restart happened a year earlier, using only pre-restart data
+fake_restart <- restart - 365 * 86400
+placebo_time <- sapply(c(occ = "occ", oil_frac = "oil_frac"), function(y) adj_did(per_pass[t < restart], y, fake_restart))
+
+# Handy one-row summaries used in the text
+occ  <- main %>% filter(metric == "occ")
+frac <- main %>% filter(metric == "oil_frac")
+```
+
+```{r}
+#| label: fig-placebo
+#| fig-cap: "Distribution of the season-adjusted BACI effect when the three-platform layout is moved to other ocean locations. The orange line is the actual platform zone."
+#| fig-width: 8
+#| fig-height: 4.2
+ggplot(placebo, aes(occ * 100)) + geom_histogram(bins = 40, fill = "#86b6ef", colour = surf, linewidth = .3) +
+  geom_vline(xintercept = occ$adj_DiD * 100, colour = col_imp, linewidth = 1) +
+  annotate("text", x = occ$adj_DiD * 100, y = Inf, label = sprintf("  Actual platform zone\n  (%.0f%% of placebos are as large)", 100 * occ$placebo_p),
+           hjust = 0, vjust = 1.3, size = 3.2, colour = ink) +
+  labs(x = "Seasonally adjusted BACI effect (pct pts of area with a slick)", y = "Placebo zones",
+       title = "How unusual is the change? Placebo platform zones across the Channel",
+       subtitle = sprintf("The platform footprint shifted to %d other ocean locations, same estimator", nrow(placebo)))
+```
+
+Of `r nrow(placebo)` placebo zones, `r round(100 * occ$placebo_p)`% show an occurrence effect at least as large as the real one (`r round(100 * frac$placebo_p)`% for oiled fraction). The placebos with effects this large are all over known hotspots: the Coal Oil Point–Carpinteria nearshore seep band, or the hotspot east of Anacapa Island. With the fake restart one year early, the estimated effect is `r pts(placebo_time[["occ"]])` points, about `r round(100 * placebo_time[["occ"]] / occ$adj_DiD)`% of the real estimate. Some of the apparent effect is therefore within the normal year-to-year noise.
+
+## Choice of control area
+
+```{r}
+#| label: control-choice
+#| analysis: true
+
+# Re-run the season-adjusted BACI against alternative control areas. The platforms sit
+# 9-13 km off the mainland, so a nearshore control may be a fairer comparison.
+not_near <- grid$dist_km > R_excl
+nearshore <- not_near & grid$coast_km <= nearshore_km
+controls <- setNames(
+  list(not_near, nearshore, nearshore & grid$lon < min(platforms_ll$lon), nearshore & grid$lon > max(platforms_ll$lon)),
+  c(sprintf("Whole Channel (>%g km)", R_excl), sprintf("Mainland nearshore band (<=%g km of coast)", nearshore_km),
+    "Nearshore, west of platforms", "Nearshore, east (Coal Oil Pt-Carpinteria)"))
+
+control_choice <- imap_dfr(controls, function(is_ctl, name) {
+  zones <- zone_map(fifelse(grid$dist_km <= R_imp, "Impact", fifelse(is_ctl, "Control", NA_character_)))
+  w <- pass_metrics(zones, min_ctl_cov = 0.5)   # control area must be at least half imaged
+  map_dfr(c("occ", "oil_frac"), function(y) {
+    e <- did(w, y); b <- block_bootstrap(w, function(x) adj_did(x, y), seed = 2)
+    tibble(control = name, metric = y, n_passes = nrow(w), n_ctl_cells = sum(is_ctl),
+           I_before = e[["I_before"]], I_after = e[["I_after"]], C_before = e[["C_before"]], C_after = e[["C_after"]],
+           adj_DiD = adj_did(w, y), lo = q_lo(b), hi = q_hi(b))
+  })
+})
+```
+
+```{r}
+#| label: tbl-control
+#| tbl-cap: "Season-adjusted DiD in occurrence (percentage points) against alternative control areas. 'Nearshore' = close to the mainland coast (see settings)."
+control_choice %>% filter(metric == "occ") %>%
+  transmute(Control = control, `Control cells` = n_ctl_cells,
+            `Impact before→after` = sprintf("%s → %s", pct(I_before), pct(I_after)),
+            `Control before→after` = sprintf("%s → %s", pct(C_before), pct(C_after)),
+            `Adjusted DiD [95% CI]` = sprintf("%s [%s]", pts(adj_DiD), ci(lo, hi))) %>%
+  kable(align = "lrrrr") %>% styl()
+east <- control_choice %>% filter(metric == "occ", str_detect(control, "east"))
+```
+
+The platforms are 9–13 km offshore of the mainland, so the whole-Channel control, which includes open water and the island coasts, may not be a fair comparison. The results depend on which control area is used:
+
+- **Nearshore west of the platforms** (toward Point Conception, few seeps): there's no change there, so the effect is largest and its interval excludes zero.
+- **Nearshore east** (Coal Oil Point to Carpinteria seeps): this area grew by about the same absolute amount as the platform zone, so the effect is near zero.
+
+In relative terms, though, the platform zone grew more than the seep band did (`r sprintf("%.1f×", occ$I_after / occ$I_before)` vs `r sprintf("%.1f×", east$C_after / east$C_before)`). So one question matters a lot here: would an unaffected platform zone have gained the same *number* of oiled cells as the seep band, or grown by the same *percentage*?
+
+## By platform
+
+```{r}
+#| label: per-platform
+#| analysis: true
+
+# Split the impact zone by nearest platform and compare each part with the control zone
+per_platform <- map_dfr(sort(platforms$name), function(p) {
+  zones <- zone_map(fifelse(grid$dist_km <= R_imp & grid$nearest == p, "Impact",
+                            fifelse(grid$dist_km > R_excl, "Control", NA_character_)))
+  pass_metrics(zones)[, .(platform = p, n_passes = .N, occ_I = mean(occ_Impact), occ_C = mean(occ_Control)), by = period]
+}) %>% mutate(period = factor(period, period_levels)) %>% arrange(platform, period)
+
+# Share of passes with ANY oil near each platform, and whether a single pass dominates
+passes_with_oil <- merge(cell_obs, data.table(cell = grid$cell, dist = grid$dist_km, platform = grid$nearest), by = "cell")[dist <= R_imp] %>%
+  merge(per_pass[, .(pass, period)], by = "pass") %>%
+  .[, .(oiled = any(oil_m2 > 0), cells = sum(oil_m2 > 0)), by = .(pass, period, platform)] %>%
+  .[, .(passes = .N, passes_with_oil = sum(oiled), pct_passes_with_oil = round(100 * mean(oiled), 1),
+        top_pass_share = round(max(cells) / max(1, sum(cells)), 2)), by = .(platform, period)] %>%
+  as_tibble() %>% mutate(period = factor(period, period_levels)) %>% arrange(platform, period)
+```
+
+```{r}
+#| label: fig-plat
+#| fig-cap: "Occurrence within 5 km of each platform (cells assigned to the nearest platform), by period."
+#| fig-width: 9
+#| fig-height: 4.8
+per_platform %>% select(platform, period, `Platform zone` = occ_I, `Rest of Channel` = occ_C) %>%
+  pivot_longer(3:4, names_to = "zone", values_to = "occ") %>%
+  ggplot(aes(period, occ * 100, fill = zone)) +
+  geom_col(position = position_dodge(width = .75), width = .7, colour = surf, linewidth = .5) +
+  geom_text(aes(label = sprintf("%.1f", occ * 100)), position = position_dodge(width = .75), vjust = -.4, size = 2.8, colour = ink2) +
+  facet_wrap(~platform) + scale_fill_manual(values = c(col_imp, col_ctl), name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0, .12))) +
+  labs(x = NULL, y = "% of observed area with a slick", title = "Slick occurrence by platform zone and period",
+       subtitle = paste0("Phase 1 = ", day_fmt(restart, "%b"), " - ", day_fmt(as.Date(restart2) - 1, "%b"),
+                         " (Harmony test restart); phase 2 = ", day_fmt(restart2, "%b"), " onward (full restart)"),
+       caption = paste0("Cells within ", R_imp, " km assigned to the nearest platform.")) +
+  theme(legend.position = "top", legend.justification = "left", axis.text.x = element_text(size = 8))
+```
+
+```{r}
+#| label: tbl-pwo
+#| tbl-cap: "Share of passes with any slick in each platform's zone, and the largest single pass's share of all oiled cells (a check on whether a few big events drive the result)."
+passes_with_oil %>%
+  transmute(Platform = platform, Period = period, Passes = passes, `Passes with oil` = passes_with_oil,
+            `% of passes` = sprintf("%.1f%%", pct_passes_with_oil), `Largest pass share` = top_pass_share) %>%
+  kable(align = "llrrrr") %>% styl() %>% collapse_rows(1)
+pw <- function(p, per) passes_with_oil %>% filter(platform == p, period == per) %>% pull(pct_passes_with_oil)
+```
+
+- **Harmony**, the platform that actually restarted in May 2025, has the clearest signal. The share of passes with oil nearby went from `r pw("Harmony","Before")`% to `r pw("Harmony","After: phase 1")`% in phase 1, spread over many passes.
+- **Hondo** also increased (`r pw("Hondo","Before")`% → `r pw("Hondo","After: phase 1")`%), even though it wasn't expected to produce until mid-2026. Hondo and Harmony are only ~4.6 km apart, so their zones touch. Hondo is also the platform nearest the Coal Oil Point seeps, which lie upstream along the coast. Either spillover from Harmony or seep drift could explain this.
+- **Heritage** shows no change, including in phase 2 after it restarted.
+
+## Radius sensitivity
+
+```{r}
+#| label: radius
+#| analysis: true
+
+# Does the answer depend on the impact-zone radius? Control = beyond max(R_excl, 2 x radius).
+radius <- map_dfr(c(2, 3, 5, 8, 10), function(r) {
+  w <- pass_metrics(zone_map(zone_of(grid$dist_km, r, max(R_excl, 2 * r))))
+  map_dfr(c("occ", "oil_frac"), function(y) {
+    e <- did(w, y)
+    b <- block_bootstrap(w, function(x) did(x, y)[["ratio_of_ratios"]], B = 1000, seed = 1)  # fewer draws: 10 runs
+    tibble(radius_km = r, metric = y, n_passes = nrow(w), I_before = e[["I_before"]], I_after = e[["I_after"]],
+           rr = e[["ratio_of_ratios"]], rr_lo = q_lo(b), rr_hi = q_hi(b))
+  })
+})
+```
+
+```{r}
+#| label: tbl-radius
+#| tbl-cap: "Ratio of ratios (unadjusted) for different impact-zone radii. Control = beyond max(10 km, 2 × radius)."
+radius %>% transmute(`Radius (km)` = radius_km, Outcome = metric_name[metric],
+                     `Impact before→after` = sprintf("%s → %s", pct(I_before, 3), pct(I_after, 3)),
+                     `Ratio of ratios [95% CI]` = sprintf("%.2f [%.2f–%.2f]", rr, rr_lo, rr_hi)) %>%
+  kable(align = "rlrr") %>% styl()
+```
+
+The relative increase is about 2× for occurrence at every radius from 2 to 10 km. Intervals get narrower as the zone grows, because more cells are averaged, but the bigger zones also take in more of the nearby seep band.
+
+## Slick-level checks {#slick-level-checks}
+
+```{r}
+#| label: slick-level
+#| analysis: true
+
+# ---- Individual slicks touching the impact zone, on passes used in the BACI
+imp_cells  <- zones_main[zone == "Impact", cell]
+imp_slicks <- slick_dt[id %in% slick_cells[cell %in% imp_cells, id] & pass %in% per_pass$pass]
+slick_counts <- merge(per_pass[, .(n_passes = .N), by = period],
+                      imp_slicks[, .(n_slicks = .N, med_area_km2 = median(area) / 1e6, mean_area_km2 = mean(area) / 1e6), by = period],
+                      by = "period", all.x = TRUE)[, per_100 := 100 * n_slicks / n_passes]
+area_test <- wilcox.test(area ~ (period == "Before"), data = imp_slicks)   # were After slicks bigger?
+
+# ---- Slicks Cerulean's source model links to each platform (infra_id at any rank)
+attribution <- map_dfr(seq_len(nrow(platforms_ll)), function(i) {
+  hits <- slick_dt[str_detect(coalesce(source_type_2_ids, ""), paste0("'", platforms_ll$infra_id[i], "'"))]
+  merge(passes[, .(n_passes = .N), by = period], hits[, .(n_attr = .N), by = period], by = "period", all.x = TRUE)[
+    , platform := platforms_ll$name[i]]
+}) %>% as_tibble() %>% mutate(n_attr = replace_na(n_attr, 0L), per_100 = 100 * n_attr / n_passes)
+
+# ---- Main estimate again, ignoring slicks Cerulean classifies as NATURAL seeps (cls 3)
+oil_not_natural <- merge(slick_cells[id %in% slick_dt[cls != 3, id]], scene_dt[, .(scene, pass)], by = "scene")[
+  , .(oil = sum(oil_m2)), by = .(pass, scene, cell)][, .(oil = max(oil)), by = .(pass, cell)]
+obs_not_natural <- merge(cell_obs[, .(pass, cell, cell_m2)], oil_not_natural, by = c("pass", "cell"), all.x = TRUE)[
+  , oil_m2 := fcoalesce(oil, 0)]
+per_pass_nn <- pass_metrics(zones_main, obs = obs_not_natural)
+not_natural <- map_dfr(c("occ", "oil_frac"), function(y) {
+  b <- block_bootstrap(per_pass_nn, function(x) adj_did(x, y), B = 1000, seed = 2)
+  tibble(metric = y, adj_DiD = adj_did(per_pass_nn, y), lo = q_lo(b), hi = q_hi(b))
+})
+```
+
+```{r}
+#| label: tbl-slicks
+#| tbl-cap: "Distinct slicks touching the impact zone, on passes that fully image it."
+slick_counts %>% as_tibble() %>% mutate(period = factor(period, period_levels)) %>% arrange(period) %>%
+  transmute(Period = period, Passes = n_passes, Slicks = n_slicks, `Per 100 passes` = sprintf("%.1f", per_100),
+            `Median area (km²)` = sprintf("%.1f", med_area_km2), `Mean area (km²)` = sprintf("%.1f", mean_area_km2)) %>%
+  kable(align = "lrrrrr") %>% styl()
+nn_occ <- not_natural %>% filter(metric == "occ")
+after_sl <- imp_slicks[period != "Before"]; before_sl <- imp_slicks[period == "Before"]
+```
+
+Slicks touching the platform zone after the restart were larger than before (Wilcoxon rank-sum *p* = `r sprintf("%.3f", area_test$p.value)`). Of those After-period slicks, `r sum(after_sl$cls == 3)` of `r nrow(after_sl)` are labeled *natural* by Cerulean, compared with `r sum(before_sl$cls == 3)` of `r nrow(before_sl)` before. Dropping natural-labeled slicks shrinks the season-adjusted occurrence effect to `r pts(nn_occ$adj_DiD)` points (95% CI `r ci(nn_occ$lo, nn_occ$hi)`).
+
+```{r}
+#| label: tbl-attr
+#| tbl-cap: "Slicks Cerulean's source-attribution model links to each platform's infrastructure ID (any rank), per 100 passes over the study area."
+attribution %>% mutate(period = factor(period, period_levels)) %>% arrange(platform, period) %>%
+  transmute(Platform = platform, Period = period, `Attributed slicks` = n_attr, `Per 100 passes` = sprintf("%.1f", per_100)) %>%
+  kable(align = "llrr") %>% styl() %>% collapse_rows(1)
+```
+
+Cerulean's own attribution agrees in direction. Slicks linked to Hondo and Harmony increased after May 2025, and those linked to Heritage did not. The model attributes a slick to infrastructure based on distance and shape, so it can't separate a platform discharge from a seep slick that drifts past a platform.
+
+# Interpretation
+
+- **There is an increase near the platforms that shouldn't be dismissed.** It lines up in time and place with the one platform that restarted first (Harmony), it's spread across many passes rather than one or two big events, and Cerulean's attribution model points the same way.
+- **The evidence is not strong enough to attribute the increase to the restart.**
+    1. After adjusting for season, the effect's confidence interval includes zero, and about `r round(100 * occ$placebo_p)`% of random placebo zones show a change this large.
+    2. The nearby seep band got oilier by a similar absolute amount over the same period, which suggests something affected the whole nearshore strip: wind, currents, seep activity, or Cerulean model changes.
+    3. The timing is inconsistent with production. The platform zone returned to baseline in early 2026, right after the full restart.
+    4. Heritage, which restarted in April 2026, shows nothing, and Hondo rose before its own restart.
+- **Bottom line:** the data are consistent with a modest increase in slicks around Harmony/Hondo after May 2025. They are about equally consistent with a nearshore-wide increase in seep slicks drifting past the platforms. More post-restart data, especially after Hondo comes online, should help separate the two.
+
+# Limitations
+
+- **Detectability.** SAR only shows slicks in moderate wind (roughly 2–10 m/s). Wind isn't controlled for directly; comparing zones on the same pass removes Channel-wide wind conditions, but not local differences.
+- **Model changes.** Cerulean's detection model has changed over time. That's only absorbed if the changes affected the whole Channel equally.
+- **Seeps vs. platforms.** Seep slicks can't be reliably separated from platform slicks. Cerulean's class labels are model output, not ground truth; only `r sum(!is.na(slick_dt$hitl_cls))` slicks have human review.
+- **Coarse coastline.** Coastline is Natural Earth 1:50m, which is coarse near shore and around the islands.
+- **One treated site.** There's a single treated area, so conventional standard errors aren't meaningful. The placebo tests are the more honest measure of uncertainty.
+- **Short After period** (`r mon_fmt(restart)`–`r mon_fmt(max(passes$t))`), which runs two summers against one winter.
+
+# Next steps
+
+1. Add wind speed (ERA5 or NDBC buoys 46053/46054) as a pass-level covariate, or restrict to passes with good detection conditions.
+2. Use slick shape and orientation: slicks from a platform should start at the platform and stretch downwind or downcurrent, while seep slicks start over known seep fields.
+3. Re-run as more post-restart data accumulates, especially after Hondo comes online (see [Updating this report](#updating)).
+4. Compare against production volumes by platform, if monthly data are available (BSEE OGOR).
+
+# Updating this report {#updating}
+
+Everything (download, analysis, figures and this text) comes from one file, `report.qmd`. Open **Show code** under any section to see how that step was done, or use the **</> Code** menu at the top to show all code or view the full source.
+
+- **Change a setting** (dates, restart dates, platforms, zone sizes): edit the `settings` block at the top of `report.qmd`. The settings used for this version are listed [below](#settings).
+- **Get the latest satellite data:** set `refresh_data <- TRUE`, render once, set it back to `FALSE`, and commit the updated `data/` folder.
+- **Render:** `quarto render report.qmd` (about 2 minutes), or click *Render* in RStudio. On GitHub, any change pushed to `report.qmd` or `data/` re-renders and republishes the report automatically.
+
+Numbers in the text update automatically. The written interpretation was written for data through September 2026, so reread it after big changes.
+
+## Settings used {#settings}
+
+Data run from `r day_fmt(min(passes$t), "%b")` to `r day_fmt(max(passes$t), "%b")`.
+
+```{r}
+#| ref.label: settings
+#| echo: true
+#| eval: false
+#| code-fold: false
+```
+
+# Sources {#sources}
+
+- SkyTruth Cerulean API: <https://api.cerulean.skytruth.org>
+- [World Oil (May 19, 2025): Sable Offshore restarts oil production from Santa Ynez Unit](https://www.worldoil.com/news/2025/5/19/sable-offshore-restarts-oil-production-from-santa-ynez-unit-10-years-after-shut-in/)
+- [Noozhawk: Sable restarts oil production, transport after federal order](https://www.noozhawk.com/sable-restarts-oil-production-transport-in-santa-barbara-county-after-federal-order/)
+- [Oil & Gas Journal (Apr 2, 2026): Sable set to resume production at second platform](https://www.ogj.com/drilling-production/production-operations/news/55368298/sable-offshore-set-to-resume-oil-production-at-second-platform-offshore-california)
+- [BOEM: Santa Ynez Unit Development and Production Plan](https://www.boem.gov/renewable-energy/9b5-1985-06-platforms-harmony-heritage-hondo-santa-ynez-unit-developmenet) (platform locations)

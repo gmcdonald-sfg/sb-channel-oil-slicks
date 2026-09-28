@@ -47,3 +47,12 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Rendered report and Quarto working files (the published copy is built by GitHub Actions)
+report.html
+report_files/
+_site/
+.quarto/
+intermediate/
+*.zip
+.DS_Store
